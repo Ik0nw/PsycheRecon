@@ -13,10 +13,13 @@ HTTP_PORTS_REGEX='(^|,)(80|443|8080|8000|8888|5000|3000|7001)(,|$)'
 # Windows/AD probing ports
 TLS_PROBE_PORTS_REGEX='(^|,)(443|636|3389|5986|8443)(,|$)'
 WIN_HTTP_PORTS_REGEX='(^|,)(80|443|8080|8000|8888|5985|5986)(,|$)'
+OS_NAME="$(uname -s 2>/dev/null || echo Unknown)"
 
 # Default wordlist (your choice)
 WORDLIST_CANDIDATES=(
   "/usr/share/amass/wordlists/subdomains-top1mil-110000.txt"
+  "/usr/local/opt/amass/share/amass/wordlists/subdomains-top1mil-110000.txt"
+  "/opt/homebrew/opt/amass/share/amass/wordlists/subdomains-top1mil-110000.txt"
 )
 
 # ────────────────────────────── Colors ──────────────────────────────
@@ -30,9 +33,63 @@ fi
 
 # ────────────────────────────── Helpers ─────────────────────────────
 die(){ echo -e "${BRED}[!]${RST} $*" >&2; exit 1; }
-need(){ command -v "$1" >/dev/null 2>&1 || die "Missing '$1' (apt update && apt install $1)"; }
+need(){
+  if ! command -v "$1" >/dev/null 2>&1; then
+    local hint="apt update && apt install $1"
+    if [[ "$OS_NAME" == "Darwin" ]]; then
+      case "$1" in
+        awk|sed|grep)
+          hint="Command '$1' is bundled with macOS; ensure /usr/bin is in PATH"
+          ;;
+        *)
+          if command -v brew >/dev/null 2>&1; then
+            hint="brew install $1"
+          else
+            hint="Install '$1' via Homebrew (https://brew.sh)"
+          fi
+          ;;
+      esac
+    fi
+    die "Missing '$1'. Try: $hint"
+  fi
+}
 hr(){ printf "%${NCOL}s\n" | tr ' ' '─'; }
 box(){ hr; printf " %s%s%s\n" "$BOLD" "$1" "$RST"; hr; }
+
+portable_mktemp(){
+  local prefix="smartmap"
+  [[ -n "${1:-}" ]] && prefix="$1"
+  local tmp
+  if tmp="$(mktemp -t "${prefix}.XXXXXX" 2>/dev/null)"; then
+    printf '%s\n' "$tmp"
+    return 0
+  fi
+  if tmp="$(mktemp 2>/dev/null)"; then
+    printf '%s\n' "$tmp"
+    return 0
+  fi
+  tmp="/tmp/${prefix}.${STAMP:-$$}.${RANDOM}"
+  : > "$tmp"
+  printf '%s\n' "$tmp"
+}
+
+read_lines_into_array(){
+  local __target="$1" __file="$2" __line
+  local __arr=()
+  while IFS= read -r __line || [[ -n "$__line" ]]; do
+    __arr+=("$__line")
+  done < "$__file"
+  eval "$__target=(\"\${__arr[@]}\")"
+}
+
+split_lines_into_array(){
+  local __target="$1" __data="$2" __line
+  local __arr=()
+  while IFS= read -r __line || [[ -n "$__line" ]]; do
+    __arr+=("$__line")
+  done <<<"$__data"
+  eval "$__target=(\"\${__arr[@]}\")"
+}
 
 spinner(){ # spinner "msg" CMD...
   local pid msg; msg="$1"; shift
@@ -45,6 +102,22 @@ spinner(){ # spinner "msg" CMD...
   done
   wait "$pid" || true
   printf "\r%s %s %s\n" "${BGRN}[✓]${RST}" "$msg" "${DIM}(done)${RST}"
+}
+
+extract_ports_csv(){ # read nmap -oG and output cleaned comma-separated ports
+  local file="$1"
+  [[ -f "$file" ]] || return 0
+  awk '
+    /Ports: / {
+      line = $0
+      sub(/.*Ports: /, "", line)
+      gsub(/\/open\/[^,]*/, "", line)
+      gsub(/[^0-9,]/, "", line)
+      gsub(/^,+|,+$/, "", line)
+      gsub(/,+/, ",", line)
+      if (length(line)) print line
+    }
+  ' "$file" 2>/dev/null
 }
 
 pretty_table(){ # stdin: "PORT\tSTATE\tSERVICE\tINFO"
@@ -90,7 +163,7 @@ add_vhosts_to_hosts(){
             | awk "NF{a[\$1]++}END{for(h in a)print h}" \
             | sort | xargs)"
 
-  local tmp; tmp="$(mktemp)"
+  local tmp; tmp="$(portable_mktemp smartmap-hosts)"
   awk -v ip="$ip" '
     $0 !~ /^[[:space:]]*#/ && $1 == ip {next}
     {print}
@@ -126,11 +199,14 @@ pick_wordlist(){
     [[ -f "$WORDLIST_OVERRIDE" ]] || die "Wordlist not found: $WORDLIST_OVERRIDE"
     echo "$WORDLIST_OVERRIDE"; return 0
   fi
-  if [[ -f "${WORDLIST_CANDIDATES[0]}" ]]; then
-    echo "${WORDLIST_CANDIDATES[0]}"
-  else
-    die "Default wordlist missing: ${WORDLIST_CANDIDATES[0]}. Use --wordlist <file>."
-  fi
+  local candidate
+  for candidate in "${WORDLIST_CANDIDATES[@]}"; do
+    if [[ -f "$candidate" ]]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  die "No default wordlist found. Provide one with --wordlist <file>."
 }
 
 # baseline size for ffuf filtering
@@ -189,7 +265,7 @@ do_subdomain_enum(){
     echo
     if (( HTB_MODE == 1 )); then
       [[ $EUID -eq 0 ]] || die "--htb mode requires root. Re-run with sudo."
-      mapfile -t NEW_SUBS < "${OUT_SUBS}.txt"
+      read_lines_into_array NEW_SUBS "${OUT_SUBS}.txt"
       add_vhosts_to_hosts "$TARGET" "$STAMP" "${NEW_SUBS[@]}"
       echo
     else
@@ -269,7 +345,7 @@ discover_windows_hostnames(){
 
   awk '
     function ishost(s) { return ( s ~ /^[A-Za-z0-9._-]+$/ && length(s) > 1 ) }
-    { gsub(/[[:space:]]+/,"",""); if(ishost($0)) print tolower($0) }
+    { gsub(/[[:space:]]+/,""); if(ishost($0)) print tolower($0) }
   ' "$hits_file" | sort -u > "${hits_file}.uniq" || true
 
   if [[ -s "${hits_file}.uniq" ]]; then
@@ -333,10 +409,7 @@ DISC_GREP="$OUTDIR/discover.grep"
 discover_ports(){ nmap -n -Pn -p- --open -oG "$DISC_GREP" "$TARGET" >/dev/null; }
 spinner "Sweeping all TCP ports" discover_ports
 
-OPEN_PORTS=$(awk '/Ports: /{
-  gsub(/\/open\/[^,]*/,"",$0);
-  match($0,/Ports: (.*)/,m); gsub(/[^0-9,]/,"",m[1]); print m[1]
-}' "$DISC_GREP" | sed 's/^,*//; s/,*$//' | tr -d ' ')
+OPEN_PORTS="$(extract_ports_csv "$DISC_GREP" | tr '\n' ',' | sed 's/,,*/,/g; s/^,*//; s/,*$//')"
 
 if [[ -z "$OPEN_PORTS" ]]; then
   echo -e "${BYEL}[!] No open TCP ports found${RST}"
@@ -374,7 +447,7 @@ if (( SCAN_UDP == 1 )); then
     spinner "Sweeping top UDP ports (200)" discover_udp_ports
   fi
 
-  OPEN_UDP_PORTS=$(awk '/Ports: /{ gsub(/\/open\/[^,]*/,"",$0); match($0,/Ports: (.*)/,m); gsub(/[^0-9,]/,"",m[1]); print m[1] }' "$UDP_DISC_GREP" 2>/dev/null | sed 's/^,*//; s/,*$//' | tr -d ' ' || true)
+  OPEN_UDP_PORTS="$(extract_ports_csv "$UDP_DISC_GREP" | tr '\n' ',' | sed 's/,,*/,/g; s/^,*//; s/,*$//')"
 
   if [[ -z "$OPEN_UDP_PORTS" ]]; then
     echo -e "${BYEL}[!] No open UDP ports found (or filtered).${RST}"
@@ -428,9 +501,14 @@ echo
 if (( SCAN_UDP == 1 )); then
   box "Summary (UDP)"
   if [[ -f "$OUTDIR/udp-discover.grep" ]]; then
-    awk '/Ports: /{ gsub(/\/open\/[^,]*/,"",$0); match($0,/Ports: (.*)/,m); gsub(/[^0-9,]/,"",m[1]); print m[1] }' "$OUTDIR/udp-discover.grep" | sed 's/^,*//; s/,*$//' | tr -d ' ' | awk '{ if(length($0)) print $0 }' | while read -r p; do
-      echo -e "  • $p"
-    done
+    UDP_DISC_LIST="$(extract_ports_csv "$OUTDIR/udp-discover.grep" | tr ',' '\n' | sed '/^$/d')"
+    if [[ -n "$UDP_DISC_LIST" ]]; then
+      while IFS= read -r p; do
+        echo -e "  • $p"
+      done <<<"$UDP_DISC_LIST"
+    else
+      echo -e "${DIM}No UDP-discovery output available.${RST}"
+    fi
   else
     echo -e "${DIM}No UDP-discovery output available.${RST}"
   fi
@@ -452,7 +530,7 @@ fi
 # ───────────────────── Vhost hints & --htb mode ─────────────────────
 VH_RAW=$(extract_vhosts "$FOCUSED_PREFIX.nmap" || true)
 if [[ -n "$VH_RAW" ]]; then
-  mapfile -t VH_ARR < <(printf '%s\n' "$VH_RAW")
+  split_lines_into_array VH_ARR "$VH_RAW"
   if (( HTB_MODE == 1 )); then
     [[ $EUID -eq 0 ]] || die "--htb mode requires root. Re-run with sudo."
     add_vhosts_to_hosts "$TARGET" "$STAMP" "${VH_ARR[@]}"
@@ -489,7 +567,7 @@ if [[ -n "$WIN_HOSTS_FILE" && -s "$WIN_HOSTS_FILE" ]]; then
     done < "$WIN_HOSTS_FILE"
   fi
 
-  mapfile -t WIN_CANDS < "$WIN_HOSTS_FILE"
+  read_lines_into_array WIN_CANDS "$WIN_HOSTS_FILE"
   if [[ ${#SYNTH[@]} -gt 0 ]]; then
     WIN_CANDS=( $(printf "%s\n" "${WIN_CANDS[@]}" "${SYNTH[@]}" | awk 'NF{a[$1]++}END{for(h in a)print h}' | sort) )
   fi
