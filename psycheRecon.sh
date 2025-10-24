@@ -104,6 +104,22 @@ spinner(){ # spinner "msg" CMD...
   printf "\r%s %s %s\n" "${BGRN}[✓]${RST}" "$msg" "${DIM}(done)${RST}"
 }
 
+extract_ports_csv(){ # read nmap -oG and output cleaned comma-separated ports
+  local file="$1"
+  [[ -f "$file" ]] || return 0
+  awk '
+    /Ports: / {
+      line = $0
+      sub(/.*Ports: /, "", line)
+      gsub(/\/open\/[^,]*/, "", line)
+      gsub(/[^0-9,]/, "", line)
+      gsub(/^,+|,+$/, "", line)
+      gsub(/,+/, ",", line)
+      if (length(line)) print line
+    }
+  ' "$file" 2>/dev/null
+}
+
 pretty_table(){ # stdin: "PORT\tSTATE\tSERVICE\tINFO"
   awk -F'\t' 'BEGIN{
     printf "%-8s %-7s %-12s %s\n","PORT","STATE","SERVICE","INFO";
@@ -393,10 +409,7 @@ DISC_GREP="$OUTDIR/discover.grep"
 discover_ports(){ nmap -n -Pn -p- --open -oG "$DISC_GREP" "$TARGET" >/dev/null; }
 spinner "Sweeping all TCP ports" discover_ports
 
-OPEN_PORTS=$(awk '/Ports: /{
-  gsub(/\/open\/[^,]*/,"",$0);
-  match($0,/Ports: (.*)/,m); gsub(/[^0-9,]/,"",m[1]); print m[1]
-}' "$DISC_GREP" | sed 's/^,*//; s/,*$//' | tr -d ' ')
+OPEN_PORTS="$(extract_ports_csv "$DISC_GREP" | tr '\n' ',' | sed 's/,,*/,/g; s/^,*//; s/,*$//')"
 
 if [[ -z "$OPEN_PORTS" ]]; then
   echo -e "${BYEL}[!] No open TCP ports found${RST}"
@@ -434,7 +447,7 @@ if (( SCAN_UDP == 1 )); then
     spinner "Sweeping top UDP ports (200)" discover_udp_ports
   fi
 
-  OPEN_UDP_PORTS=$(awk '/Ports: /{ gsub(/\/open\/[^,]*/,"",$0); match($0,/Ports: (.*)/,m); gsub(/[^0-9,]/,"",m[1]); print m[1] }' "$UDP_DISC_GREP" 2>/dev/null | sed 's/^,*//; s/,*$//' | tr -d ' ' || true)
+  OPEN_UDP_PORTS="$(extract_ports_csv "$UDP_DISC_GREP" | tr '\n' ',' | sed 's/,,*/,/g; s/^,*//; s/,*$//')"
 
   if [[ -z "$OPEN_UDP_PORTS" ]]; then
     echo -e "${BYEL}[!] No open UDP ports found (or filtered).${RST}"
@@ -488,9 +501,14 @@ echo
 if (( SCAN_UDP == 1 )); then
   box "Summary (UDP)"
   if [[ -f "$OUTDIR/udp-discover.grep" ]]; then
-    awk '/Ports: /{ gsub(/\/open\/[^,]*/,"",$0); match($0,/Ports: (.*)/,m); gsub(/[^0-9,]/,"",m[1]); print m[1] }' "$OUTDIR/udp-discover.grep" | sed 's/^,*//; s/,*$//' | tr -d ' ' | awk '{ if(length($0)) print $0 }' | while read -r p; do
-      echo -e "  • $p"
-    done
+    UDP_DISC_LIST="$(extract_ports_csv "$OUTDIR/udp-discover.grep" | tr ',' '\n' | sed '/^$/d')"
+    if [[ -n "$UDP_DISC_LIST" ]]; then
+      while IFS= read -r p; do
+        echo -e "  • $p"
+      done <<<"$UDP_DISC_LIST"
+    else
+      echo -e "${DIM}No UDP-discovery output available.${RST}"
+    fi
   else
     echo -e "${DIM}No UDP-discovery output available.${RST}"
   fi
